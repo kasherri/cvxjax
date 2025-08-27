@@ -20,7 +20,7 @@ class QPData:
     """Standard quadratic program format.
     
     Represents the problem:
-        minimize    (1/2) x^T Q x + q^T x
+        minimize    (1/2) x^T Q x + q^T x + constant
         subject to  A_eq x = b_eq
                    A_ineq x <= b_ineq  
                    lb <= x <= ub
@@ -28,6 +28,7 @@ class QPData:
     Args:
         Q: Quadratic cost matrix (n x n).
         q: Linear cost vector (n,).
+        constant: Constant term in objective.
         A_eq: Equality constraint matrix (m_eq x n).
         b_eq: Equality constraint vector (m_eq,).
         A_ineq: Inequality constraint matrix (m_ineq x n).
@@ -41,6 +42,7 @@ class QPData:
     """
     Q: jnp.ndarray
     q: jnp.ndarray
+    constant: float
     A_eq: jnp.ndarray
     b_eq: jnp.ndarray
     A_ineq: jnp.ndarray  
@@ -57,7 +59,7 @@ class QPData:
 tree_util.register_pytree_node(
     QPData,
     lambda qp: (
-        (qp.Q, qp.q, qp.A_eq, qp.b_eq, qp.A_ineq, qp.b_ineq, qp.lb, qp.ub),
+        (qp.Q, qp.q, qp.constant, qp.A_eq, qp.b_eq, qp.A_ineq, qp.b_ineq, qp.lb, qp.ub),
         {"variables": qp.variables, "n_vars": qp.n_vars, "n_eq": qp.n_eq, "n_ineq": qp.n_ineq}
     ),
     lambda aux, children: QPData(*children, **aux),
@@ -151,7 +153,8 @@ def build_qp(objective_expr: Expression, constraints: List[Constraint]) -> QPDat
             else:
                 q = q.at[start:end].set(jnp.diag(coeff))
     
-    # Note: constant term is ignored for QP formulation
+    # Store the constant term for objective calculation
+    constant_term = constant
     
     # Note: maximize/minimize handling is done at the API layer
     
@@ -261,7 +264,7 @@ def build_qp(objective_expr: Expression, constraints: List[Constraint]) -> QPDat
         n_ineq = 0
     
     return QPData(
-        Q=Q, q=q, A_eq=A_eq, b_eq=b_eq, A_ineq=A_ineq, b_ineq=b_ineq,
+        Q=Q, q=q, constant=constant_term, A_eq=A_eq, b_eq=b_eq, A_ineq=A_ineq, b_ineq=b_ineq,
         lb=lb, ub=ub, variables=variables, n_vars=n_vars, n_eq=n_eq, n_ineq=n_ineq
     )
 
@@ -495,6 +498,7 @@ def unpack_static(packed_data: PackedQPData, variables: List[Variable]) -> QPDat
     return QPData(
         Q=arrays["Q"],
         q=arrays["q"],
+        constant=0.0,  # TODO: Pack/unpack constant term
         A_eq=arrays["A_eq"],
         b_eq=arrays["b_eq"],
         A_ineq=arrays["A_ineq"],

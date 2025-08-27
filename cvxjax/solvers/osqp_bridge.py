@@ -105,7 +105,7 @@ def solve_qp_osqp(
         )
     
     # Compute objective value
-    obj_value = 0.5 * x_opt @ qp_data.Q @ x_opt + qp_data.q @ x_opt
+    obj_value = 0.5 * x_opt @ qp_data.Q @ x_opt + qp_data.q @ x_opt + qp_data.constant
     
     # Build primal solution mapping
     primal = {}

@@ -54,10 +54,20 @@ def sum_squares(expr: Expression) -> QuadraticExpression:
         # Build quadratic and linear terms
         for var, coeff in expr.coeffs.items():
             # Quadratic term: 2 * coeff^T coeff (factor of 2 for standard QP form)
-            quad_coeffs[(var, var)] = 2.0 * coeff.T @ coeff
+            if coeff.ndim == 0:
+                # Scalar coefficient
+                quad_coeffs[(var, var)] = 2.0 * coeff ** 2
+            else:
+                # Vector/matrix coefficient
+                quad_coeffs[(var, var)] = 2.0 * coeff.T @ coeff
             
             # Linear term: 2 * offset^T coeff  
-            lin_coeffs[var] = 2 * expr.offset @ coeff
+            if coeff.ndim == 0:
+                # Scalar coefficient
+                lin_coeffs[var] = 2 * jnp.sum(expr.offset) * coeff
+            else:
+                # Vector/matrix coefficient
+                lin_coeffs[var] = 2 * expr.offset @ coeff
         
         return QuadraticExpression(
             quad_coeffs=quad_coeffs,

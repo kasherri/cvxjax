@@ -100,9 +100,9 @@ def solve_portfolio_basic(expected_returns: jnp.ndarray,
     
     # Create and solve problem
     problem = cx.Problem(objective, constraints)
-    solution = problem.solve_jit(solver="ipm", tol=1e-8)
+    solution = problem.solve(solver="ipm", tol=1e-8)
     
-    return solution
+    return solution, w
 
 
 def solve_portfolio_long_only(expected_returns: jnp.ndarray,
@@ -136,9 +136,9 @@ def solve_portfolio_long_only(expected_returns: jnp.ndarray,
     
     # Create and solve problem
     problem = cx.Problem(objective, constraints)
-    solution = problem.solve_jit(solver="ipm", tol=1e-8)
+    solution = problem.solve(solver="ipm", tol=1e-8)
     
-    return solution
+    return solution, w
 
 
 def solve_portfolio_box_constraints(expected_returns: jnp.ndarray,
@@ -177,9 +177,9 @@ def solve_portfolio_box_constraints(expected_returns: jnp.ndarray,
     
     # Create and solve problem
     problem = cx.Problem(objective, constraints)
-    solution = problem.solve_jit(solver="ipm", tol=1e-8)
+    solution = problem.solve(solver="ipm", tol=1e-8)
     
-    return solution
+    return solution, w
 
 
 def solve_portfolio_transaction_costs(expected_returns: jnp.ndarray,
@@ -215,7 +215,7 @@ def solve_portfolio_transaction_costs(expected_returns: jnp.ndarray,
     # Constraints
     constraints = [
         cx.sum(w) == 1,                           # Budget constraint
-        w - current_weights == t_plus - t_minus,  # Trade decomposition
+        w == current_weights + t_plus - t_minus,  # Trade decomposition
         t_plus >= 0,                              # Positive trades
         t_minus >= 0,                             # Negative trades
         w >= 0                                    # Long-only (optional)
@@ -223,9 +223,9 @@ def solve_portfolio_transaction_costs(expected_returns: jnp.ndarray,
     
     # Create and solve problem
     problem = cx.Problem(objective, constraints)
-    solution = problem.solve_jit(solver="ipm", tol=1e-8)
+    solution = problem.solve(solver="ipm", tol=1e-8)
     
-    return solution
+    return solution, w, t_plus, t_minus
 
 
 def compute_portfolio_stats(weights: jnp.ndarray,
@@ -283,10 +283,10 @@ def main():
     risk_aversions = [0.5, 1.0, 2.0, 5.0]
     
     for gamma in risk_aversions:
-        solution = solve_portfolio_basic(expected_returns, covariance_matrix, risk_aversion=gamma)
+        solution, w = solve_portfolio_basic(expected_returns, covariance_matrix, risk_aversion=gamma)
         
         if solution.status == "optimal":
-            weights = solution.primal["weights"]
+            weights = solution.primal[w]
             stats = compute_portfolio_stats(weights, expected_returns, covariance_matrix)
             
             print(f"Risk aversion γ = {gamma}:")
@@ -305,12 +305,12 @@ def main():
     print("-" * 35)
     
     for gamma in [1.0, 2.0]:
-        solution_basic = solve_portfolio_basic(expected_returns, covariance_matrix, risk_aversion=gamma)
-        solution_long_only = solve_portfolio_long_only(expected_returns, covariance_matrix, risk_aversion=gamma)
+        solution_basic, w_basic = solve_portfolio_basic(expected_returns, covariance_matrix, risk_aversion=gamma)
+        solution_long_only, w_long_only = solve_portfolio_long_only(expected_returns, covariance_matrix, risk_aversion=gamma)
         
         if solution_basic.status == "optimal" and solution_long_only.status == "optimal":
-            weights_basic = solution_basic.primal["weights"]
-            weights_long_only = solution_long_only.primal["weights"]
+            weights_basic = solution_basic.primal[w_basic]
+            weights_long_only = solution_long_only.primal[w_long_only]
             
             stats_basic = compute_portfolio_stats(weights_basic, expected_returns, covariance_matrix)
             stats_long_only = compute_portfolio_stats(weights_long_only, expected_returns, covariance_matrix)
@@ -331,12 +331,12 @@ def main():
     w_min = jnp.zeros(n_assets)
     w_max = jnp.full(n_assets, 0.30)
     
-    solution_box = solve_portfolio_box_constraints(
+    solution_box, w_box = solve_portfolio_box_constraints(
         expected_returns, covariance_matrix, w_min, w_max, risk_aversion=1.0
     )
     
     if solution_box.status == "optimal":
-        weights_box = solution_box.primal["weights"]
+        weights_box = solution_box.primal[w_box]
         stats_box = compute_portfolio_stats(weights_box, expected_returns, covariance_matrix)
         
         print("Position limits [0%, 30%]:")
@@ -361,22 +361,19 @@ def main():
     transaction_costs = [0.0, 0.001, 0.005, 0.01]  # 0%, 0.1%, 0.5%, 1%
     
     for tc in transaction_costs:
-        solution_tc = solve_portfolio_transaction_costs(
+        solution_tc, w_tc, t_plus_tc, t_minus_tc = solve_portfolio_transaction_costs(
             expected_returns, covariance_matrix, current_weights,
             transaction_cost=tc, risk_aversion=1.0
         )
         
         if solution_tc.status == "optimal":
-            weights_tc = solution_tc.primal["weights"]
+            weights_tc = solution_tc.primal[w_tc]
             stats_tc = compute_portfolio_stats(weights_tc, expected_returns, covariance_matrix)
             
             # Compute total trades
-            if "trades_plus" in solution_tc.primal and "trades_minus" in solution_tc.primal:
-                trades_plus = solution_tc.primal["trades_plus"]
-                trades_minus = solution_tc.primal["trades_minus"]
-                total_trades = jnp.sum(trades_plus + trades_minus)
-            else:
-                total_trades = jnp.sum(jnp.abs(weights_tc - current_weights))
+            trades_plus = solution_tc.primal[t_plus_tc]
+            trades_minus = solution_tc.primal[t_minus_tc]
+            total_trades = jnp.sum(trades_plus + trades_minus)
             
             print(f"Transaction cost {tc*100:.1f}%:")
             print(f"  Sharpe ratio: {stats_tc['sharpe_ratio']:.4f}")
@@ -397,10 +394,10 @@ def main():
     frontier_sharpes = []
     
     for gamma in gammas:
-        solution = solve_portfolio_long_only(expected_returns, covariance_matrix, risk_aversion=gamma)
+        solution, w = solve_portfolio_long_only(expected_returns, covariance_matrix, risk_aversion=gamma)
         
         if solution.status == "optimal":
-            weights = solution.primal["weights"]
+            weights = solution.primal[w]
             stats = compute_portfolio_stats(weights, expected_returns, covariance_matrix)
             
             frontier_returns.append(stats['expected_return'])
