@@ -1,7 +1,5 @@
 # CVXJAX
 
-[![CI](https://github.com/cvxjax/cvxjax/workflows/CI/badge.svg)](https://github.com/cvxjax/cvxjax/actions)
-[![PyPI version](https://badge.fury.io/py/cvxjax.svg)](https://badge.fury.io/py/cvxjax)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A JAX-native convex optimization library providing an MVP analogue of CVXPY with automatic differentiation through the solution map.
