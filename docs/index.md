@@ -1,53 +1,48 @@
 # CVXJAX Documentation
 
-Welcome to **CVXJAX** - a JAX-native convex optimization library that brings the expressiveness of CVXPY to the JAX ecosystem.
+**CVXJAX** is a JAX-native convex optimization library that brings the expressiveness of CVXPY to the JAX ecosystem. It enables high-performance, differentiable optimization with JIT compilation, automatic differentiation, and GPU acceleration.
 
-## What is CVXJAX?
+## Why CVXJAX?
 
-CVXJAX is a domain-specific language for convex optimization problems built on top of JAX. It provides:
+- 🚀 **High Performance**: JIT compilation and GPU acceleration through JAX
+- 🎯 **Automatic Differentiation**: Differentiable optimization for machine learning
+- 📝 **Familiar API**: Similar to CVXPY for easy adoption
+- 🔧 **JAX Integration**: Seamless integration with the JAX ecosystem
+- ⚡ **Multiple Solvers**: Interior point, OSQP, and specialized solvers
 
-- **JAX-native implementation**: Full compatibility with JAX transformations (jit, grad, vmap)
-- **Expressive API**: Clean, CVXPY-inspired modeling interface  
-- **Automatic differentiation**: Differentiable optimization through implicit function theorem
-- **Multiple solvers**: Built-in IPM and OSQP integration
-- **Static shapes**: Designed for compilation and efficient execution
-
-## Quick Start
+## Quick Example
 
 ```python
-import jax.numpy as jnp
 import cvxjax as cx
+import jax.numpy as jnp
 
-# Define optimization variables
-x = cx.Variable(shape=(2,), name="x")
+# Portfolio optimization
+w = cx.Variable(shape=(n_assets,), name="weights")
+objective = cx.Minimize(-returns @ w + gamma * cx.quad_form(w, Sigma))
+constraints = [cx.sum(w) == 1, w >= 0]
 
-# Define objective
-objective = cx.Minimize(cx.sum_squares(x - jnp.array([1.0, 2.0])))
-
-# Define constraints  
-constraints = [x >= 0, cx.sum(x) <= 3]
-
-# Create and solve problem
 problem = cx.Problem(objective, constraints)
-solution = problem.solve()
+solution = problem.solve(solver="ipm")
 
-print(f"Optimal value: {solution.obj_value}")
-print(f"Optimal x: {solution.primal['x']}")
+if solution.status == "optimal":
+    optimal_weights = solution.primal[w]
 ```
 
-## Key Features
+## Documentation Structure
 
-### 🚀 JAX Integration
-- Native JAX arrays and operations
-- JIT compilation support
-- Automatic differentiation through solutions
-- Vectorization with vmap
+### � **Learning Resources**
+- **[Getting Started](getting_started.md)** - Step-by-step tutorial with examples
+- **[Quick Reference](quick_reference.md)** - Concise API overview and common patterns
+- **[API Reference](api_reference.md)** - Complete function documentation
 
-### 🎯 Convex Optimization
-- Quadratic programs (QP)
-- Linear programs (LP)  
-- Conic optimization (coming soon)
-- Rich expression system
+### 🎯 **Practical Guides**
+- **[Concepts](concepts.md)** - Core optimization concepts and mathematical background
+- **[Troubleshooting](troubleshooting.md)** - Common issues and solutions
+
+### 💡 **Examples**
+- **[Portfolio Optimization](../examples/)** - Mean-variance optimization, risk models
+- **[Machine Learning](../examples/)** - Regression, regularization, SVM
+- **[Engineering](../examples/)** - Control, signal processing, network optimization
 
 ### 🔧 Multiple Solvers
 - **IPM**: Dense interior-point method (pure JAX)

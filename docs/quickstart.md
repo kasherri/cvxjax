@@ -1,6 +1,6 @@
 # Quick Start Guide
 
-This guide will get you up and running with CVXJAX in 5 minutes.
+This guide will get you up and running with CVXJAX in 5 minutes. For detailed documentation, see [API Reference](api_reference.md).
 
 ## Installation
 
