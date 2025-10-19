@@ -486,4 +486,4 @@ constraint = (x == y + z - w)
 solution = problem.solve(solver="ipm")  # Instead of solve_jit()
 ```
 
-Happy optimizing with CVXJAX! 🚀
+Happy optimizing with CVXJAX! 

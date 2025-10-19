@@ -9,13 +9,14 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 
-from cvxjax.canonicalize import build_qp
+from cvxjax.canonicalize import build_qp, QPData
 from cvxjax.constraints import Constraint
 from cvxjax.diff import solve_qp_diff
 from cvxjax.expressions import AffineExpression, Expression
 from cvxjax.solvers.ipm_qp import solve_qp_dense
 from cvxjax.solvers.osqp_bridge import solve_qp_osqp
 from cvxjax.solvers.boxosqp_solver import solve_qp_boxosqp
+from cvxjax.solvers.boxcdqp_solver import solve_qp_boxcdqp_wrapper
 from cvxjax.utils.checking import check_variable_shape
 
 
@@ -328,7 +329,7 @@ class Problem:
     def solve(
         self,
         params: Optional[Dict[Parameter, jnp.ndarray]] = None,
-        solver: Literal["ipm", "osqp", "boxosqp"] = "ipm",
+        solver: Literal["ipm", "osqp", "boxosqp", "boxcdqp"] = "ipm",
         tol: float = 1e-8,
         max_iter: int = 50,
         **solver_kwargs: Any,
@@ -337,7 +338,7 @@ class Problem:
         
         Args:
             params: Optional parameter values to override defaults.
-            solver: Solver to use ("ipm", "osqp", or "boxosqp").
+            solver: Solver to use ("ipm", "osqp", "boxosqp", or "boxcdqp").
             tol: Tolerance for convergence.
             max_iter: Maximum number of iterations.
             **solver_kwargs: Additional solver-specific arguments.
@@ -360,19 +361,22 @@ class Problem:
         
         # Solve based on selected solver
         if solver == "ipm":
-            return solve_qp_dense(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
+            # IPM solver is still under development for JIT compatibility
+            raise NotImplementedError("IPM solver is still under development. Please use 'boxcdqp' or 'osqp' instead.")
         elif solver == "osqp":
             return solve_qp_osqp(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
         elif solver == "boxosqp":
             return solve_qp_boxosqp(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
+        elif solver == "boxcdqp":
+            return solve_qp_boxcdqp_wrapper(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
         else:
-            # For JIT compatibility, default to IPM solver if unknown solver specified
-            return solve_qp_dense(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
+            # Default to BoxCDQP solver for best JIT compatibility
+            return solve_qp_boxcdqp_wrapper(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
     
     def solve_jit(
         self,
         params: Optional[Dict[Parameter, jnp.ndarray]] = None,
-        solver: Literal["ipm", "osqp"] = "ipm",
+        solver: Literal["boxcdqp", "boxosqp"] = "boxcdqp",
         tol: float = 1e-8,
         max_iter: int = 50,
         **solver_kwargs: Any,
@@ -384,7 +388,7 @@ class Problem:
         
         Args:
             params: Optional parameter values to override defaults.
-            solver: Solver to use ("ipm" or "osqp").
+            solver: Solver to use ("boxcdqp" or "boxosqp").
             tol: Tolerance for convergence.
             max_iter: Maximum number of iterations.
             **solver_kwargs: Additional solver-specific arguments.
@@ -392,17 +396,30 @@ class Problem:
         Returns:
             Solution object with optimal values and solver information.
         """
-        @jax.jit
-        def _solve_compiled(qp_data):
-            if solver == "ipm":
-                return solve_qp_dense(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
-            else:
-                return solve_qp_osqp(qp_data, tol=tol, max_iter=max_iter, **solver_kwargs)
-        
-        # Build QP formulation
+        # Build QP formulation first (non-JIT)
         qp_data = build_qp(self.objective.expression, self.constraints)
         
-        return _solve_compiled(qp_data)
+        # Extract static components for JIT compilation
+        @jax.jit  
+        def _solve_compiled(Q, q, constant, A_eq, b_eq, A_ineq, b_ineq, lb, ub, n_vars, n_eq, n_ineq):
+            # Reconstruct QPData inside JIT function with static shapes
+            qp_data_jit = QPData(
+                Q=Q, q=q, constant=constant,
+                A_eq=A_eq, b_eq=b_eq, A_ineq=A_ineq, b_ineq=b_ineq,
+                lb=lb, ub=ub, variables=qp_data.variables,
+                n_vars=n_vars, n_eq=n_eq, n_ineq=n_ineq
+            )
+            
+            if solver == "boxcdqp":
+                return solve_qp_boxcdqp_wrapper(qp_data_jit, tol=tol, max_iter=max_iter, **solver_kwargs)
+            else:
+                return solve_qp_boxosqp(qp_data_jit, tol=tol, max_iter=max_iter, **solver_kwargs)
+        
+        return _solve_compiled(
+            qp_data.Q, qp_data.q, qp_data.constant,
+            qp_data.A_eq, qp_data.b_eq, qp_data.A_ineq, qp_data.b_ineq,
+            qp_data.lb, qp_data.ub, qp_data.n_vars, qp_data.n_eq, qp_data.n_ineq
+        )
     
     def solve_diff(
         self,

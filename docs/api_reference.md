@@ -25,8 +25,10 @@ CVXJAX is a JAX-native convex optimization library designed for high-performance
    - [EqualityConstraint](#equalityconstraint)
    - [InequalityConstraint](#inequalityconstraint)
    - [BoxConstraint](#boxconstraint)
-5. [Solver Interface](#solver-interface)
-6. [Examples](#examples)
+5. [Differentiable Layers](#differentiable-layers)
+   - [CvxLayer](#cvxlayer)
+6. [Solver Interface](#solver-interface)
+7. [Examples](#examples)
 
 ---
 
@@ -466,6 +468,66 @@ class BoxConstraint(Constraint):
 ```
 
 **Description:** Box constraints `lb <= variable <= ub`.
+
+---
+
+## Differentiable Layers
+
+### CvxLayer
+
+```python
+class CvxLayer:
+    def __init__(
+        self,
+        problem: Problem,
+        solver: str = "ipm",
+        settings: Optional[Any] = None,
+        return_fields: tuple[str, ...] = ("primal",),
+        diff_mode: Literal["implicit", "unroll", "none"] = "implicit",
+    )
+```
+
+**Description:** Differentiable CVX layer that wraps a CVXJAX Problem into a JAX-callable differentiable function. This enables using convex optimization as a layer within neural networks and other differentiable pipelines.
+
+**Parameters:**
+- `problem` (Problem): CVXJAX Problem instance to wrap
+- `solver` (str): Solver backend ("ipm", "osqp", "boxosqp", "boxcdqp")
+- `settings` (Optional[Any]): Solver-specific settings
+- `return_fields` (tuple[str, ...]): Output fields ("primal", "dual", "obj")
+- `diff_mode` (str): Differentiation mode ("implicit", "unroll", "none")
+
+**Key Features:**
+- **JIT Compatibility:** Works with `jax.jit` for compiled execution
+- **Batching:** Compatible with `jax.vmap` for batch processing
+- **Automatic Differentiation:** Supports gradient computation through solutions
+- **Multiple Solvers:** Choose the best solver for your problem type
+
+**Example:**
+```python
+import jax.numpy as jnp
+from cvxjax import Variable, Problem, Minimize, CvxLayer, sum_squares
+
+# Define problem
+x = Variable((3,))
+prob = Problem(Minimize(sum_squares(x)), [x >= 0])
+
+# Create differentiable layer
+layer = CvxLayer(prob, solver="ipm", return_fields=("primal",))
+
+# Use in differentiable computation
+x_star = layer({})
+
+# Compute gradients through custom loss function
+def loss_fn(scale):
+    x = Variable((2,))
+    test_prob = Problem(Minimize(scale * sum_squares(x)), [x >= 0])
+    test_layer = CvxLayer(test_prob, solver="ipm")
+    solution = test_layer({})
+    return jnp.sum(solution**2)
+
+grad_fn = jax.grad(loss_fn)
+gradient = grad_fn(1.0)
+```
 
 ---
 

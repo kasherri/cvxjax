@@ -11,6 +11,7 @@ from cvxjax.api import (
 )
 from cvxjax.atoms import abs, quad_form, square, sum, sum_squares
 from cvxjax.constraints import Constraint
+from cvxjax.layers import CvxLayer
 
 __version__ = "0.1.0"
 
@@ -23,6 +24,7 @@ __all__ = [
     "Problem",
     "Solution",
     "Constraint",
+    "CvxLayer",
     "quad_form",
     "sum",
     "sum_squares",

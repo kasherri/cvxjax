@@ -52,14 +52,17 @@ def solve_qp_osqp(
     osqp_data = _convert_to_osqp_format(qp_data)
     
     # Set up OSQP solver
-    solver = jaxopt.OSQP(
-        tol=tol,
-        maxiter=max_iter,
-        rho=rho,
-        sigma=sigma,
-        alpha=alpha,
-        **osqp_kwargs
-    )
+    # Filter out unsupported parameters for jaxopt.OSQP
+    osqp_params = {
+        "tol": tol,
+        "maxiter": max_iter,
+    }
+    # Only add supported kwargs
+    allowed_kwargs = ["tol", "maxiter", "verbose"]
+    for k, v in osqp_kwargs.items():
+        if k in allowed_kwargs:
+            osqp_params[k] = v
+    solver = jaxopt.OSQP(**osqp_params)
     
     # Solve
     try:

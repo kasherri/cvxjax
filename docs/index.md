@@ -2,13 +2,6 @@
 
 **CVXJAX** is a JAX-native convex optimization library that brings the expressiveness of CVXPY to the JAX ecosystem. It enables high-performance, differentiable optimization with JIT compilation, automatic differentiation, and GPU acceleration.
 
-## Why CVXJAX?
-
-- 🚀 **High Performance**: JIT compilation and GPU acceleration through JAX
-- 🎯 **Automatic Differentiation**: Differentiable optimization for machine learning
-- 📝 **Familiar API**: Similar to CVXPY for easy adoption
-- 🔧 **JAX Integration**: Seamless integration with the JAX ecosystem
-- ⚡ **Multiple Solvers**: Interior point, OSQP, and specialized solvers
 
 ## Quick Example
 

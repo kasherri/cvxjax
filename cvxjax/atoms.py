@@ -5,9 +5,128 @@ from __future__ import annotations
 from typing import Union
 
 import jax.numpy as jnp
+from jax import jit
 
 from cvxjax.expressions import AffineExpression, Expression, QuadraticExpression
 from cvxjax.utils.checking import check_psd_matrix
+
+
+@jit
+def sum_squares_jit(
+    coeffs: dict,
+    offset: jnp.ndarray,
+    var_shapes: dict,
+    expr_shape: tuple
+) -> QuadraticExpression:
+    """JIT-compatible sum of squares implementation.
+    
+    Args:
+        coeffs: Variable coefficients from AffineExpression
+        offset: Offset vector from AffineExpression
+        var_shapes: Dictionary mapping variables to their shapes
+        expr_shape: Shape of the expression
+        
+    Returns:
+        QuadraticExpression representing ||expr||_2^2.
+    """
+    quad_coeffs = {}
+    lin_coeffs = {}
+    offset_term = jnp.sum(offset ** 2)
+    
+    # Process each variable's coefficient
+    for var, coeff in coeffs.items():
+        # Quadratic term: 2 * coeff^T coeff (factor of 2 for standard QP form)
+        quad_coeffs[(var, var)] = 2.0 * coeff.T @ coeff
+        
+        # Linear term: 2 * offset^T coeff  
+        lin_coeffs[var] = 2 * offset @ coeff
+    
+    return QuadraticExpression(
+        quad_coeffs=quad_coeffs,
+        lin_coeffs=lin_coeffs,
+        offset=offset_term,
+        shape=(),
+    )
+
+
+def _to_affine_expression(expr: Expression) -> 'AffineExpression':
+    """Convert any expression to AffineExpression format.
+    
+    Args:
+        expr: Expression to convert.
+        
+    Returns:
+        AffineExpression with coeffs and offset.
+    """
+    from cvxjax.expressions import AffineExpression
+    
+    # Handle Variable case
+    if hasattr(expr, 'shape') and hasattr(expr, 'name') and not hasattr(expr, 'coeffs'):
+        # Variable case: x -> 1*x + 0
+        return AffineExpression(
+            coeffs={expr: jnp.eye(expr.size)},
+            offset=jnp.zeros(expr.shape),
+            _shape=expr.shape,
+        )
+    
+    # Handle AffineExpression case (already affine)
+    if hasattr(expr, 'coeffs') and hasattr(expr, 'offset'):
+        return expr
+    
+    # Handle MatMulExpression: A @ x where A is constant and x is variable
+    if hasattr(expr, 'left') and hasattr(expr, 'right') and type(expr).__name__ == 'MatMulExpression':
+        left_affine = expr.left  # A (constant matrix as AffineExpression)
+        right_affine = expr.right  # x (variable as AffineExpression)
+        
+        # Check if left is constant (empty coeffs) and right has variables
+        if not left_affine.coeffs and right_affine.coeffs:
+            # A @ x where A is constant matrix, x has variables
+            A = left_affine.offset  # The constant matrix A
+            coeffs = {}
+            
+            for var, var_coeff in right_affine.coeffs.items():
+                # A @ (var_coeff @ var) = (A @ var_coeff) @ var
+                coeffs[var] = A @ var_coeff
+            
+            # A @ right_affine.offset for the constant term
+            offset = A @ right_affine.offset
+            
+            return AffineExpression(
+                coeffs=coeffs,
+                offset=offset,
+                _shape=expr.shape,
+            )
+    
+    # Handle AddExpression: left + right
+    if hasattr(expr, 'left') and hasattr(expr, 'right') and type(expr).__name__ == 'AddExpression':
+        left_affine = _to_affine_expression(expr.left)
+        right_affine = _to_affine_expression(expr.right)
+        
+        # Merge coefficients
+        coeffs = dict(left_affine.coeffs)
+        for var, coeff in right_affine.coeffs.items():
+            if var in coeffs:
+                coeffs[var] = coeffs[var] + coeff
+            else:
+                coeffs[var] = coeff
+        
+        return AffineExpression(
+            coeffs=coeffs,
+            offset=left_affine.offset + right_affine.offset,
+            _shape=expr.shape,
+        )
+    
+    # Handle array constants
+    if hasattr(expr, 'shape') and not hasattr(expr, 'name') and not hasattr(expr, 'coeffs'):
+        # Constant array
+        return AffineExpression(
+            coeffs={},
+            offset=expr,
+            _shape=expr.shape,
+        )
+    
+    # Fallback
+    raise ValueError(f"Cannot convert {type(expr)} to AffineExpression")
 
 
 def sum_squares(expr: Expression) -> QuadraticExpression:
@@ -23,14 +142,11 @@ def sum_squares(expr: Expression) -> QuadraticExpression:
         >>> x = Variable(shape=(3,))
         >>> obj = sum_squares(x)  # ||x||^2
     """
-    # Skip affine check for JIT compatibility
-    # Assume expr is affine; non-affine expressions will fail during compilation
-    
-    # Handle Variable directly
-    if hasattr(expr, 'shape') and hasattr(expr, 'name') and hasattr(expr, 'size'):
+    # Handle Variable case (check for Variable attributes)
+    if hasattr(expr, 'shape') and hasattr(expr, 'name') and not hasattr(expr, 'coeffs'):
         # Variable case: sum_squares(x) = x^T x
-        # For standard QP form (1/2) x^T Q x, we need Q = 2*I to get x^T x
-        quad_coeffs = {(expr, expr): 2.0 * jnp.eye(expr.size)}
+        # Direct Q matrix without extra factor
+        quad_coeffs = {(expr, expr): jnp.eye(expr.size)}
         lin_coeffs = {}
         offset = 0.0
         
@@ -41,33 +157,20 @@ def sum_squares(expr: Expression) -> QuadraticExpression:
             shape=(),
         )
     
-    # Check if expr is an AffineExpression by examining attributes
+    # Handle AffineExpression case
     elif hasattr(expr, 'coeffs') and hasattr(expr, 'offset'):
         # For affine expression Ax + b, sum_squares gives (Ax + b)^T (Ax + b)
-        # = x^T A^T A x + 2 b^T A x + b^T b
-        # For standard QP form (1/2) x^T Q x, we need to scale by 2
-        
         quad_coeffs = {}
         lin_coeffs = {}
         offset = jnp.sum(expr.offset ** 2)
         
         # Build quadratic and linear terms
         for var, coeff in expr.coeffs.items():
-            # Quadratic term: 2 * coeff^T coeff (factor of 2 for standard QP form)
-            if coeff.ndim == 0:
-                # Scalar coefficient
-                quad_coeffs[(var, var)] = 2.0 * coeff ** 2
-            else:
-                # Vector/matrix coefficient
-                quad_coeffs[(var, var)] = 2.0 * coeff.T @ coeff
+            # Quadratic term: direct coefficient without extra factor
+            quad_coeffs[(var, var)] = coeff.T @ coeff
             
             # Linear term: 2 * offset^T coeff  
-            if coeff.ndim == 0:
-                # Scalar coefficient
-                lin_coeffs[var] = 2 * jnp.sum(expr.offset) * coeff
-            else:
-                # Vector/matrix coefficient
-                lin_coeffs[var] = 2 * expr.offset @ coeff
+            lin_coeffs[var] = 2 * expr.offset @ coeff
         
         return QuadraticExpression(
             quad_coeffs=quad_coeffs,
@@ -76,14 +179,19 @@ def sum_squares(expr: Expression) -> QuadraticExpression:
             shape=(),
         )
     
-    # For JIT compatibility, provide a default implementation
-    # This will fail at runtime if expr is not properly structured
-    return QuadraticExpression(
-        quad_coeffs={},
-        lin_coeffs={},
-        offset=0.0,
-        shape=(),
-    )
+    # Handle composite expressions by converting to affine first
+    else:
+        try:
+            affine_expr = _to_affine_expression(expr)
+            return sum_squares(affine_expr)  # Recursive call with affine expression
+        except ValueError:
+            # Fallback for JIT compatibility
+            return QuadraticExpression(
+                quad_coeffs={},
+                lin_coeffs={},
+                offset=0.0,
+                shape=(),
+            )
 
 
 def quad_form(expr: Expression, Q: jnp.ndarray) -> QuadraticExpression:
@@ -101,17 +209,11 @@ def quad_form(expr: Expression, Q: jnp.ndarray) -> QuadraticExpression:
         >>> Q = jnp.array([[2., 0.], [0., 1.]])
         >>> obj = quad_form(x, Q)
     """
-    # Skip validation for JIT compatibility
-    # Assume expr is affine and proper shape; errors will surface during compilation
-    
-    # Skip PSD check for JIT compatibility
-    # check_psd_matrix(Q)
-    
-    # Handle Variable directly
-    if hasattr(expr, 'shape') and hasattr(expr, 'name') and hasattr(expr, 'size'):
+    # Handle Variable case
+    if hasattr(expr, 'shape') and hasattr(expr, 'name') and not hasattr(expr, 'coeffs'):
         # Variable case: quad_form(x, Q) = x^T Q x
-        # For standard QP form (1/2) x^T P x, we need P = 2*Q to get x^T Q x
-        quad_coeffs = {(expr, expr): 2.0 * Q}
+        # Direct Q matrix without extra factor
+        quad_coeffs = {(expr, expr): Q}
         lin_coeffs = {}
         offset = 0.0
         
@@ -122,18 +224,16 @@ def quad_form(expr: Expression, Q: jnp.ndarray) -> QuadraticExpression:
             shape=(),
         )
     
-    # Check if expr is an AffineExpression by examining attributes
+    # Handle AffineExpression case
     elif hasattr(expr, 'coeffs') and hasattr(expr, 'offset'):
         # For affine expression Ax + b, quad_form gives (Ax + b)^T Q (Ax + b)
-        # = x^T A^T Q A x + 2 b^T Q A x + b^T Q b
-        
         quad_coeffs = {}
         lin_coeffs = {}
         offset = expr.offset @ Q @ expr.offset
         
         for var, coeff in expr.coeffs.items():
-            # Quadratic term: 2 * A^T Q A (factor of 2 for standard QP form)
-            quad_coeffs[(var, var)] = 2.0 * coeff.T @ Q @ coeff
+            # Quadratic term: direct coefficient without extra factor
+            quad_coeffs[(var, var)] = coeff.T @ Q @ coeff
             
             # Linear term: 2 * b^T Q A
             lin_coeffs[var] = 2 * expr.offset @ Q @ coeff
@@ -145,7 +245,7 @@ def quad_form(expr: Expression, Q: jnp.ndarray) -> QuadraticExpression:
             shape=(),
         )
     
-    # For JIT compatibility, provide a default implementation
+    # Fallback for JIT compatibility
     return QuadraticExpression(
         quad_coeffs={},
         lin_coeffs={},

@@ -1,4 +1,7 @@
-"""Canonicalization of optimization problems to standard forms."""
+"""Canonicalization of optimization problems to standard forms.
+
+
+"""
 
 from __future__ import annotations
 
@@ -6,13 +9,65 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import jax.numpy as jnp
-from jax import tree_util
+from jax import tree_util, lax, jit
 
 if TYPE_CHECKING:
     from cvxjax.api import Variable
 
 from cvxjax.constraints import BoxConstraint, Constraint, EqualityConstraint, InequalityConstraint
 from cvxjax.expressions import AffineExpression, Expression, QuadraticExpression
+
+
+@dataclass(frozen=True)
+class CanonicalData:
+    """Vectorized data for canonical form with static shapes.
+    
+    This structure holds all constraint and objective data in vectorized form
+    to enable JIT compilation without Python control flow.
+    """
+    # Variable metadata (static)
+    var_sizes: jnp.ndarray  # Size of each variable
+    var_offsets: jnp.ndarray  # Offset indices for each variable
+    n_vars_total: jnp.ndarray  # Total number of scalar variables (as array)
+    
+    # Objective data
+    Q: jnp.ndarray  # Quadratic term matrix
+    q: jnp.ndarray  # Linear term vector
+    constant: float  # Constant term
+    
+    # Constraint data (vectorized)
+    constraint_types: jnp.ndarray  # 0=eq, 1=ineq_leq, 2=ineq_geq, 3=box
+    constraint_A: jnp.ndarray  # Constraint matrix rows (max_constraints x n_vars)
+    constraint_b: jnp.ndarray  # Constraint RHS values
+    constraint_mask: jnp.ndarray  # Boolean mask for active constraints
+    
+    # Box constraint bounds
+    lb: jnp.ndarray  # Lower bounds
+    ub: jnp.ndarray  # Upper bounds
+    
+    # Sizes (as JAX arrays to avoid concretization)
+    n_constraints: jnp.ndarray  # Number of active constraints
+    n_eq: jnp.ndarray  # Number of equality constraints  
+    n_ineq: jnp.ndarray  # Number of inequality constraints
+
+
+# Register as JAX pytree
+tree_util.register_pytree_node(
+    CanonicalData,
+    lambda cd: (
+        (cd.var_sizes, cd.var_offsets, cd.n_vars_total, cd.Q, cd.q, cd.constraint_types, 
+         cd.constraint_A, cd.constraint_b, cd.constraint_mask, cd.lb, cd.ub,
+         cd.n_constraints, cd.n_eq, cd.n_ineq),
+        {"constant": cd.constant}
+    ),
+    lambda aux, children: CanonicalData(
+        var_sizes=children[0], var_offsets=children[1], n_vars_total=children[2],
+        Q=children[3], q=children[4], constant=aux["constant"],
+        constraint_types=children[5], constraint_A=children[6], constraint_b=children[7],
+        constraint_mask=children[8], lb=children[9], ub=children[10],
+        n_constraints=children[11], n_eq=children[12], n_ineq=children[13]
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -36,9 +91,9 @@ class QPData:
         lb: Lower bounds (n,), -inf for unbounded.
         ub: Upper bounds (n,), +inf for unbounded.
         variables: List of variables in order.
-        n_vars: Number of variables.
-        n_eq: Number of equality constraints.
-        n_ineq: Number of inequality constraints.
+        n_vars: Number of variables (JAX array for JIT compatibility).
+        n_eq: Number of equality constraints (JAX array for JIT compatibility).
+        n_ineq: Number of inequality constraints (JAX array for JIT compatibility).
     """
     Q: jnp.ndarray
     q: jnp.ndarray
@@ -50,19 +105,24 @@ class QPData:
     lb: jnp.ndarray
     ub: jnp.ndarray
     variables: List[Variable]
-    n_vars: int
-    n_eq: int
-    n_ineq: int
+    n_vars: jnp.ndarray  # Changed to JAX array for JIT compatibility
+    n_eq: jnp.ndarray    # Changed to JAX array for JIT compatibility
+    n_ineq: jnp.ndarray  # Changed to JAX array for JIT compatibility
 
 
 # Register QPData as JAX pytree
 tree_util.register_pytree_node(
     QPData,
     lambda qp: (
-        (qp.Q, qp.q, qp.constant, qp.A_eq, qp.b_eq, qp.A_ineq, qp.b_ineq, qp.lb, qp.ub),
-        {"variables": qp.variables, "n_vars": qp.n_vars, "n_eq": qp.n_eq, "n_ineq": qp.n_ineq}
+        (qp.Q, qp.q, qp.A_eq, qp.b_eq, qp.A_ineq, qp.b_ineq, qp.lb, qp.ub, qp.n_vars, qp.n_eq, qp.n_ineq),
+        {"variables": qp.variables, "constant": qp.constant}
     ),
-    lambda aux, children: QPData(*children, **aux),
+    lambda aux, children: QPData(
+        Q=children[0], q=children[1], constant=aux["constant"],
+        A_eq=children[2], b_eq=children[3], A_ineq=children[4], b_ineq=children[5],
+        lb=children[6], ub=children[7], variables=aux["variables"],
+        n_vars=children[8], n_eq=children[9], n_ineq=children[10]
+    ),
 )
 
 
@@ -100,184 +160,550 @@ tree_util.register_pytree_node(
 )
 
 
+
+
+
+
+
+
 def build_qp(objective_expr: Expression, constraints: List[Constraint]) -> QPData:
-    """Build QP formulation from objective and constraints.
-    
+    """JIT-compatible QP builder. Converts objective and constraints to vectorized form and returns QPData.
     Args:
         objective_expr: Objective expression to minimize.
         constraints: List of constraints.
-        
     Returns:
-        QPData representing the standard form QP.
-        
+        QPData representing the standard form QP (JIT-compatible).
     Raises:
         ValueError: If problem is not a valid QP.
     """
-    # Extract all variables
+    # Extract variables and build mapping
     variables = _extract_variables(objective_expr, constraints)
     n_vars = sum(var.size for var in variables)
     
-    # Build variable index mapping
-    var_indices = {}
-    start_idx = 0
-    for var in variables:
-        var_indices[var] = (start_idx, start_idx + var.size)
-        start_idx += var.size
+    # Get preprocessed data from prepare_problem_data
+    objective_data, constraint_data, _ = prepare_problem_data(objective_expr, constraints)
     
-    # Handle objective expression (assume minimization - API layer handles max/min)
-    obj_expr = objective_expr
+    # Extract matrices directly from prepared data
+    Q = objective_data['Q']
+    q = objective_data['q'] 
+    constant = objective_data['constant']
     
-    # Build Q and q from objective
+    constraint_types = constraint_data['types']
+    constraint_A = constraint_data['A']
+    constraint_b = constraint_data['b']
+    constraint_mask = constraint_data['mask']
+    
+    # Initialize bounds from variable bounds arrays
+    lb = constraint_data.get('var_lower', jnp.full(n_vars, -jnp.inf))
+    ub = constraint_data.get('var_upper', jnp.full(n_vars, jnp.inf))
+    
+    # Apply additional box constraints if any (from explicit BoxConstraint objects)
+    box_mask = constraint_types == 3
+    box_lower = constraint_data['box_lower']
+    box_upper = constraint_data['box_upper']
+    
+    # Use JAX where to conditionally update bounds from box constraints
+    lb = jnp.where(
+        box_mask[:n_vars] & (box_lower[:n_vars] > -jnp.inf),
+        box_lower[:n_vars], 
+        lb
+    )
+    ub = jnp.where(
+        box_mask[:n_vars] & (box_upper[:n_vars] < jnp.inf),
+        box_upper[:n_vars], 
+        ub
+    )
+    
+    # Build constraint matrices using extract_qp_matrices_static logic directly
+    eq_mask = constraint_mask & (constraint_types == 0)
+    ineq_leq_mask = constraint_mask & (constraint_types == 1) 
+    ineq_geq_mask = constraint_mask & (constraint_types == 2)
+    
+    # Build equality constraint matrix with masking
+    A_eq_full = jnp.where(eq_mask[:, None], constraint_A, 0.0)
+    b_eq_full = jnp.where(eq_mask, constraint_b, 0.0)
+    
+    # Build inequality constraint matrices with masking
+    # For <= constraints
+    A_ineq_leq = jnp.where(ineq_leq_mask[:, None], constraint_A, 0.0)
+    b_ineq_leq = jnp.where(ineq_leq_mask, constraint_b, 0.0)
+    
+    # For >= constraints (convert to <= by negating)
+    A_ineq_geq = jnp.where(ineq_geq_mask[:, None], -constraint_A, 0.0)
+    b_ineq_geq = jnp.where(ineq_geq_mask, -constraint_b, 0.0)
+    
+    # Combine inequality constraints
+    A_ineq_full = A_ineq_leq + A_ineq_geq
+    b_ineq_full = b_ineq_leq + b_ineq_geq
+    ineq_mask_full = ineq_leq_mask | ineq_geq_mask
+    
+    # Zero out inactive inequality constraints
+    A_ineq_full = jnp.where(ineq_mask_full[:, None], A_ineq_full, 0.0)
+    b_ineq_full = jnp.where(ineq_mask_full, b_ineq_full, 0.0)
+    
+    # Count active constraints
+    n_eq_actual = jnp.sum(eq_mask)
+    n_ineq_actual = jnp.sum(ineq_mask_full)
+    
+    # Use the maximum possible number of constraints for static sizing
+    max_constraints = len(constraints)
+    
+    # Extract only active constraints to avoid shape mismatches
+    # For equality constraints
+    eq_indices = jnp.where(eq_mask, size=max_constraints, fill_value=0)[0]
+    A_eq_active = A_eq_full[eq_indices[:n_eq_actual]]
+    b_eq_active = b_eq_full[eq_indices[:n_eq_actual]]
+    
+    # For inequality constraints  
+    ineq_indices = jnp.where(ineq_mask_full, size=max_constraints, fill_value=0)[0]
+    A_ineq_active = A_ineq_full[ineq_indices[:n_ineq_actual]]
+    b_ineq_active = b_ineq_full[ineq_indices[:n_ineq_actual]]
+    
+    return QPData(
+        Q=Q,
+        q=q,
+        constant=constant,
+        A_eq=A_eq_active,
+        b_eq=b_eq_active,
+        A_ineq=A_ineq_active,
+        b_ineq=b_ineq_active,
+        lb=lb,
+        ub=ub,
+        variables=variables,
+        n_vars=jnp.array(n_vars),
+        n_eq=n_eq_actual,
+        n_ineq=n_ineq_actual
+    )
+
+
+
+
+# JIT-compatible constraint processing functions
+@jit
+def process_constraints_vectorized(
+    constraint_types: jnp.ndarray,
+    constraint_A: jnp.ndarray, 
+    constraint_b: jnp.ndarray,
+    constraint_mask: jnp.ndarray,
+    n_vars: int
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Process constraints in vectorized form for JIT compilation.
+    
+    Args:
+        constraint_types: Array of constraint type codes (0=eq, 1=ineq_leq, 2=ineq_geq, 3=box)
+        constraint_A: Constraint coefficient matrix
+        constraint_b: Constraint RHS values
+        constraint_mask: Boolean mask for active constraints
+        n_vars: Number of variables
+        
+    Returns:
+        Tuple of (A_eq, b_eq, A_ineq, b_ineq)
+    """
+    # Extract equality constraints
+    eq_mask = constraint_mask & (constraint_types == 0)
+    A_eq = jnp.where(
+        eq_mask[:, None], 
+        constraint_A, 
+        jnp.zeros_like(constraint_A)
+    )
+    b_eq = jnp.where(eq_mask, constraint_b, 0.0)
+    
+    # Filter to only active equality constraints
+    active_eq = jnp.sum(eq_mask)
+    A_eq = A_eq[:active_eq]
+    b_eq = b_eq[:active_eq]
+    
+    # Extract inequality constraints
+    ineq_leq_mask = constraint_mask & (constraint_types == 1)
+    ineq_geq_mask = constraint_mask & (constraint_types == 2)
+    
+    # Process <= constraints
+    A_ineq_leq = jnp.where(
+        ineq_leq_mask[:, None],
+        constraint_A,
+        jnp.zeros_like(constraint_A)
+    )
+    b_ineq_leq = jnp.where(ineq_leq_mask, constraint_b, 0.0)
+    
+    # Process >= constraints (convert to <= by negating)
+    A_ineq_geq = jnp.where(
+        ineq_geq_mask[:, None],
+        -constraint_A,  # Negate to convert >= to <=
+        jnp.zeros_like(constraint_A)
+    )
+    b_ineq_geq = jnp.where(ineq_geq_mask, -constraint_b, 0.0)  # Negate RHS too
+    
+    # Combine all inequality constraints
+    A_ineq = jnp.concatenate([A_ineq_leq, A_ineq_geq], axis=0)
+    b_ineq = jnp.concatenate([b_ineq_leq, b_ineq_geq], axis=0)
+    
+    # Filter to only active inequality constraints  
+    active_ineq = jnp.sum(ineq_leq_mask) + jnp.sum(ineq_geq_mask)
+    A_ineq = A_ineq[:active_ineq]
+    b_ineq = b_ineq[:active_ineq]
+    
+    return A_eq, b_eq, A_ineq, b_ineq
+
+
+@jit
+def update_bounds_vectorized(
+    lb: jnp.ndarray,
+    ub: jnp.ndarray,
+    constraint_types: jnp.ndarray,
+    constraint_mask: jnp.ndarray,
+    box_lower: jnp.ndarray,
+    box_upper: jnp.ndarray,
+    var_indices: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Update variable bounds from box constraints in vectorized form.
+    
+    Args:
+        lb: Current lower bounds
+        ub: Current upper bounds  
+        constraint_types: Constraint type codes
+        constraint_mask: Active constraint mask
+        box_lower: Lower bound values for box constraints
+        box_upper: Upper bound values for box constraints
+        var_indices: Variable index mapping
+        
+    Returns:
+        Updated (lb, ub) bounds
+    """
+    # Identify box constraints
+    box_mask = constraint_mask & (constraint_types == 3)
+    
+    # Update bounds using vectorized operations
+    lb = jnp.where(
+        box_mask & (box_lower > -jnp.inf),
+        jnp.maximum(lb, box_lower),
+        lb
+    )
+    
+    ub = jnp.where(
+        box_mask & (box_upper < jnp.inf),
+        jnp.minimum(ub, box_upper),
+        ub
+    )
+    
+    return lb, ub
+
+
+@jit
+def build_objective_matrices_vectorized(
+    Q_data: jnp.ndarray,
+    q_data: jnp.ndarray,
+    Q_indices: jnp.ndarray,
+    q_indices: jnp.ndarray,
+    n_vars: int
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Build objective matrices Q and q in vectorized form.
+    
+    Args:
+        Q_data: Quadratic coefficient values
+        q_data: Linear coefficient values  
+        Q_indices: Indices for Q matrix placement
+        q_indices: Indices for q vector placement
+        n_vars: Number of variables
+        
+    Returns:
+        Objective matrices (Q, q)
+    """
+    # Initialize matrices
     Q = jnp.zeros((n_vars, n_vars))
     q = jnp.zeros(n_vars)
     
-    # Extract quadratic and linear terms from objective
-    quad_terms, lin_terms, constant = _extract_objective_terms(obj_expr)
+    # Use scatter operations to place coefficients
+    Q = Q.at[Q_indices[:, 0], Q_indices[:, 1]].add(Q_data)
+    q = q.at[q_indices].add(q_data)
     
-    # Build Q matrix from quadratic terms
-    for (var1, var2), coeff in quad_terms.items():
-        if var1 == var2:  # Diagonal quadratic term
-            start1, end1 = var_indices[var1]
-            Q = Q.at[start1:end1, start1:end1].set(coeff)
+    return Q, q
+
+
+@jit
+def canonicalize_problem(
+    Q: jnp.ndarray,
+    q: jnp.ndarray,
+    constant: float,
+    constraint_types: jnp.ndarray,
+    constraint_A: jnp.ndarray,
+    constraint_b: jnp.ndarray,
+    constraint_mask: jnp.ndarray,
+    box_lower: jnp.ndarray,
+    box_upper: jnp.ndarray
+) -> QPData:
+    """Main JIT-compatible canonicalization function.
     
-    # Build q vector from linear terms
-    for var, coeff in lin_terms.items():
-        start, end = var_indices[var]
-        if coeff.ndim == 0:
-            # Scalar coefficient
-            q = q.at[start:end].set(coeff)
-        else:
-            # Vector coefficient - extract diagonal or flatten
-            if coeff.ndim == 1:
-                q = q.at[start:end].set(coeff)
-            else:
-                q = q.at[start:end].set(jnp.diag(coeff))
-    
-    # Store the constant term for objective calculation
-    constant_term = constant
-    
-    # Note: maximize/minimize handling is done at the API layer
-    
-    # Build constraint matrices
-    eq_rows = []
-    eq_rhs = []
-    ineq_rows = []
-    ineq_rhs = []
+    Args:
+        Q: Quadratic cost matrix
+        q: Linear cost vector
+        constant: Constant term in objective
+        constraint_types: Array of constraint type codes
+        constraint_A: Constraint coefficient matrix
+        constraint_b: Constraint RHS values
+        constraint_mask: Boolean mask for active constraints
+        box_lower: Lower bound values for box constraints
+        box_upper: Upper bound values for box constraints
+        
+    Returns:
+        Canonicalized QPData
+    """
+    # This function is now redundant since build_qp handles everything directly
+    # Keeping for backward compatibility but redirecting to build_qp logic
+    n_vars = Q.shape[0]
     
     # Initialize bounds
     lb = jnp.full(n_vars, -jnp.inf)
     ub = jnp.full(n_vars, jnp.inf)
     
+    # Apply box constraints
+    box_mask = constraint_types == 3
+    lb = jnp.where(
+        box_mask[:n_vars] & (box_lower[:n_vars] > -jnp.inf),
+        box_lower[:n_vars], 
+        lb
+    )
+    ub = jnp.where(
+        box_mask[:n_vars] & (box_upper[:n_vars] < jnp.inf),
+        box_upper[:n_vars], 
+        ub
+    )
+    
+    # Build constraint matrices
+    eq_mask = constraint_mask & (constraint_types == 0)
+    ineq_leq_mask = constraint_mask & (constraint_types == 1) 
+    ineq_geq_mask = constraint_mask & (constraint_types == 2)
+    
+    A_eq_full = jnp.where(eq_mask[:, None], constraint_A, 0.0)
+    b_eq_full = jnp.where(eq_mask, constraint_b, 0.0)
+    
+    A_ineq_leq = jnp.where(ineq_leq_mask[:, None], constraint_A, 0.0)
+    b_ineq_leq = jnp.where(ineq_leq_mask, constraint_b, 0.0)
+    
+    A_ineq_geq = jnp.where(ineq_geq_mask[:, None], -constraint_A, 0.0)
+    b_ineq_geq = jnp.where(ineq_geq_mask, -constraint_b, 0.0)
+    
+    A_ineq_full = A_ineq_leq + A_ineq_geq
+    b_ineq_full = b_ineq_leq + b_ineq_geq
+    ineq_mask_full = ineq_leq_mask | ineq_geq_mask
+    
+    A_ineq_full = jnp.where(ineq_mask_full[:, None], A_ineq_full, 0.0)
+    b_ineq_full = jnp.where(ineq_mask_full, b_ineq_full, 0.0)
+    
+    n_eq_actual = jnp.sum(eq_mask)
+    n_ineq_actual = jnp.sum(ineq_mask_full)
+    
+    # Extract only active constraints to avoid shape mismatches
+    # For equality constraints
+    eq_indices = jnp.where(eq_mask, size=max_constraints, fill_value=0)[0]
+    A_eq_active = A_eq_full[eq_indices[:n_eq_actual]]
+    b_eq_active = b_eq_full[eq_indices[:n_eq_actual]]
+    
+    # For inequality constraints  
+    ineq_indices = jnp.where(ineq_mask_full, size=max_constraints, fill_value=0)[0]
+    A_ineq_active = A_ineq_full[ineq_indices[:n_ineq_actual]]
+    b_ineq_active = b_ineq_full[ineq_indices[:n_ineq_actual]]
+    
+    return QPData(
+        Q=Q,
+        q=q,
+        constant=constant,
+        A_eq=A_eq_active,
+        b_eq=b_eq_active,
+        A_ineq=A_ineq_active,
+        b_ineq=b_ineq_active,
+        lb=lb,
+        ub=ub,
+        variables=[],  # No variables in JIT context
+        n_vars=jnp.array(n_vars),
+        n_eq=n_eq_actual,
+        n_ineq=n_ineq_actual
+    )
+
+
+def prepare_problem_data(
+    objective_expr: Expression, 
+    constraints: List[Constraint],
+    max_constraints: int = 100
+) -> tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]]:
+    """Prepare problem data for JIT compilation by pre-processing into vectorized form.
+    
+    This function handles Python objects and control flow to prepare static data
+    that can be used in JIT-compiled functions.
+    
+    Args:
+        objective_expr: Objective expression
+        constraints: List of constraints
+        max_constraints: Maximum number of constraints (for static sizing)
+        
+    Returns:
+        Tuple of (objective_data, constraint_data, var_metadata)
+    """
+    # Extract variables and build metadata
+    variables = _extract_variables(objective_expr, constraints)
+    var_sizes = jnp.array([var.size for var in variables])
+    var_offsets = jnp.cumsum(jnp.concatenate([jnp.array([0]), var_sizes[:-1]]))
+    n_vars_total = int(jnp.sum(var_sizes))
+    
+    var_metadata = {
+        'sizes': var_sizes,
+        'offsets': var_offsets,
+        'n_total': n_vars_total
+    }
+    
+    # Build variable index mapping for objective processing
+    var_indices = {}
+    start_idx = 0
+    for i, var in enumerate(variables):
+        var_indices[var] = (start_idx, start_idx + var.size)
+        start_idx += var.size
+    
+    # Extract objective terms
+    quad_terms, lin_terms, constant = _extract_objective_terms(objective_expr)
+    
+    # Build objective matrices
+    Q = jnp.zeros((n_vars_total, n_vars_total))
+    q = jnp.zeros(n_vars_total)
+    
+    # Process quadratic terms
+    for (var1, var2), coeff in quad_terms.items():
+        if var1 == var2:  # Diagonal quadratic term
+            start1, end1 = var_indices[var1]
+            Q = Q.at[start1:end1, start1:end1].set(coeff)
+    
+    # Process linear terms
+    for var, coeff in lin_terms.items():
+        start, end = var_indices[var]
+        if coeff.ndim == 0:
+            q = q.at[start:end].set(coeff)
+        else:
+            if coeff.ndim == 1:
+                q = q.at[start:end].set(coeff)
+            else:
+                q = q.at[start:end].set(jnp.diag(coeff))
+    
+    objective_data = {
+        'Q': Q,
+        'q': q,
+        'constant': constant
+    }
+    
+    # Process constraints into vectorized form
+    constraint_types = jnp.zeros(max_constraints, dtype=jnp.int32)
+    constraint_A = jnp.zeros((max_constraints, n_vars_total))
+    constraint_b = jnp.zeros(max_constraints)
+    constraint_mask = jnp.zeros(max_constraints, dtype=bool)
+    box_lower = jnp.full(max_constraints, -jnp.inf)
+    box_upper = jnp.full(max_constraints, jnp.inf)
+    
+    # Variable bounds arrays (indexed by variable, not constraint)
+    var_lower = jnp.full(n_vars_total, -jnp.inf)
+    var_upper = jnp.full(n_vars_total, jnp.inf)
+    
+    constraint_idx = 0
     for constraint in constraints:
+        if constraint_idx >= max_constraints:
+            break
+            
         if isinstance(constraint, EqualityConstraint):
-            row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars)
-            eq_rows.append(row)
-            eq_rhs.append(-rhs)  # Move constant to RHS
+            row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars_total)
+            constraint_types = constraint_types.at[constraint_idx].set(0)  # equality
+            constraint_A = constraint_A.at[constraint_idx].set(row)
+            constraint_b = constraint_b.at[constraint_idx].set(-rhs)
+            constraint_mask = constraint_mask.at[constraint_idx].set(True)
+            constraint_idx += 1
             
         elif isinstance(constraint, InequalityConstraint):
-            # Handle vector constraints by expanding them into scalar constraints
-            expr = constraint.expression
-            if (isinstance(expr, AffineExpression) and 
-                len(expr.coeffs) == 1 and 
-                jnp.allclose(expr.offset, 0)):
-                # Simple variable constraint like x >= 0
-                var, coeff = next(iter(expr.coeffs.items()))
-                if var in var_indices and jnp.allclose(coeff, jnp.eye(var.size)):
-                    # Vector constraint x >= 0 - expand to element-wise constraints
-                    start, end = var_indices[var]
-                    for i in range(var.size):
-                        # Create row for x[i] >= 0 
-                        row = jnp.zeros(n_vars)
-                        row = row.at[start + i].set(1.0)
-                        
-                        if constraint.sense == "<=":
-                            ineq_rows.append(row)
-                            ineq_rhs.append(0.0)
-                        else:  # ">="
-                            ineq_rows.append(-row)
-                            ineq_rhs.append(0.0)
-                else:
-                    # General affine constraint - handle as before
-                    row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars)
-                    if constraint.sense == "<=":
-                        ineq_rows.append(row)
-                        ineq_rhs.append(-rhs)
-                    else:  # ">="
-                        ineq_rows.append(-row)
-                        ineq_rhs.append(rhs)
-            else:
-                # General case
-                row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars)
-                if constraint.sense == "<=":
-                    ineq_rows.append(row)
-                    ineq_rhs.append(-rhs)
-                else:  # ">="
-                    ineq_rows.append(-row)
-                    ineq_rhs.append(rhs)
+            # Check if this is a simple variable bound that should be converted to box constraint
+            if (isinstance(constraint.expression, AffineExpression) and 
+                len(constraint.expression.coeffs) == 1):
                 
-        elif isinstance(constraint, BoxConstraint):
-            # Handle box constraints by updating bounds
-            if not isinstance(constraint.expression, AffineExpression):
-                raise ValueError("Box constraints require affine expressions")
+                var, coeff = next(iter(constraint.expression.coeffs.items()))
+                start, end = var_indices[var]
+                
+                # Check if coefficient selects exactly one component (unit vector)
+                if coeff.ndim == 2 and coeff.shape[0] == 1:
+                    coeff_flat = coeff.flatten()
+                    if jnp.sum(jnp.abs(coeff_flat)) == 1.0:  # Exactly one non-zero entry with value 1
+                        # Find which component this selects
+                        component_idx = jnp.argmax(jnp.abs(coeff_flat))
+                        var_idx_in_problem = start + component_idx
+                        
+                        # This is a simple variable bound - handle directly as bound
+                        # Constraint is: coeff * x + offset sense 0
+                        # For unit coeff: x + offset sense 0 → x sense -offset
+                        bound_value = -jnp.sum(constraint.expression.offset)
+                        
+                        if constraint.sense == ">=":
+                            # x + offset >= 0  →  x >= -offset
+                            var_lower = var_lower.at[var_idx_in_problem].set(bound_value)
+                        else:  # "<="
+                            # x + offset <= 0  →  x <= -offset
+                            var_upper = var_upper.at[var_idx_in_problem].set(bound_value)
+                        
+                        # Skip adding this as a constraint since it's now a bound
+                        continue
             
-            # For simple variable bounds
+            # Regular inequality constraint processing
+            row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars_total)
+            if constraint.sense == "<=":
+                constraint_types = constraint_types.at[constraint_idx].set(1)  # ineq_leq
+                constraint_A = constraint_A.at[constraint_idx].set(row)
+                constraint_b = constraint_b.at[constraint_idx].set(-rhs)
+            else:  # ">="
+                constraint_types = constraint_types.at[constraint_idx].set(2)  # ineq_geq
+                constraint_A = constraint_A.at[constraint_idx].set(-row)
+                constraint_b = constraint_b.at[constraint_idx].set(rhs)
+            constraint_mask = constraint_mask.at[constraint_idx].set(True)
+            constraint_idx += 1
+            
+        elif isinstance(constraint, BoxConstraint):
+            # Handle box constraints
+            if not isinstance(constraint.expression, AffineExpression):
+                continue
+                
             if len(constraint.expression.coeffs) == 1:
                 var, coeff = next(iter(constraint.expression.coeffs.items()))
                 start, end = var_indices[var]
                 
-                # Check if coefficient is identity (simple variable bound)
                 if jnp.allclose(coeff, jnp.eye(var.size)):
-                    if constraint.lower is not None:
-                        lb = lb.at[start:end].set(constraint.lower)
-                    if constraint.upper is not None:
-                        ub = ub.at[start:end].set(constraint.upper)
-                else:
-                    # General affine box constraint - convert to inequalities
-                    if constraint.lower is not None:
-                        row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars)
-                        ineq_rows.append(-row)
-                        ineq_rhs.append(constraint.lower + rhs)
-                    if constraint.upper is not None:
-                        row, rhs = _build_constraint_row(constraint.expression, var_indices, n_vars)
-                        ineq_rows.append(row)
-                        ineq_rhs.append(constraint.upper - rhs)
-        else:
-            raise ValueError(f"Unsupported constraint type: {type(constraint)}")
+                    # Simple variable bounds
+                    for i in range(var.size):
+                        if constraint_idx >= max_constraints:
+                            break
+                        constraint_types = constraint_types.at[constraint_idx].set(3)  # box
+                        if constraint.lower is not None:
+                            box_lower = box_lower.at[constraint_idx].set(constraint.lower)
+                        if constraint.upper is not None:
+                            box_upper = box_upper.at[constraint_idx].set(constraint.upper)
+                        constraint_mask = constraint_mask.at[constraint_idx].set(True)
+                        constraint_idx += 1
     
-    # Convert to arrays
-    if eq_rows:
-        A_eq = jnp.array(eq_rows)
-        b_eq = jnp.array(eq_rhs)
-        n_eq = len(eq_rows)
-    else:
-        A_eq = jnp.zeros((0, n_vars))
-        b_eq = jnp.zeros(0)
-        n_eq = 0
+    constraint_data = {
+        'types': constraint_types,
+        'A': constraint_A,
+        'b': constraint_b,
+        'mask': constraint_mask,
+        'box_lower': box_lower,
+        'box_upper': box_upper,
+        'var_lower': var_lower,
+        'var_upper': var_upper
+    }
     
-    if ineq_rows:
-        A_ineq = jnp.array(ineq_rows)
-        b_ineq = jnp.array(ineq_rhs)
-        n_ineq = len(ineq_rows)
-    else:
-        A_ineq = jnp.zeros((0, n_vars))
-        b_ineq = jnp.zeros(0)
-        n_ineq = 0
-    
-    return QPData(
-        Q=Q, q=q, constant=constant_term, A_eq=A_eq, b_eq=b_eq, A_ineq=A_ineq, b_ineq=b_ineq,
-        lb=lb, ub=ub, variables=variables, n_vars=n_vars, n_eq=n_eq, n_ineq=n_ineq
-    )
+    return objective_data, constraint_data, var_metadata
 
 
 def build_lp(objective_expr: Expression, constraints: List[Constraint]) -> LPData:
-    """Build LP formulation from objective and constraints.
+    """JIT-compatible LP builder. Converts objective and constraints to vectorized form and returns LPData.
     
     Args:
         objective_expr: Linear objective expression.
         constraints: List of constraints.
         
     Returns:
-        LPData representing the standard form LP.
+        LPData representing the standard form LP (JIT-compatible).
+        
+    Raises:
+        ValueError: If objective is not affine or contains quadratic terms.
     """
     if not objective_expr.is_affine():
         raise ValueError("LP requires affine objective")
@@ -357,13 +783,24 @@ def _build_constraint_row(expr: Expression, var_indices: Dict[Variable, tuple[in
         for var, coeff in expr.coeffs.items():
             if var in var_indices:
                 start, end = var_indices[var]
-                # Handle scalar vs vector variables
+                # Handle scalar vs vector/matrix variables
                 if coeff.ndim == 0:
                     # Scalar coefficient for scalar variable
                     row = row.at[start:end].set(coeff)
-                else:
-                    # Extract diagonal for vector variable
+                elif coeff.ndim == 2:
+                    # 2D coefficient - extract diagonal for vector variable
                     row = row.at[start:end].set(jnp.diag(coeff))
+                else:
+                    # Multi-dimensional coefficient (e.g., matrix variables)
+                    # Flatten the coefficient and select appropriate elements
+                    coeff_reshaped = coeff.reshape(-1, var.size)
+                    if coeff_reshaped.shape[0] == var.size and jnp.allclose(coeff_reshaped, jnp.eye(var.size)):
+                        # This is an identity mapping - use the first row or diagonal
+                        row = row.at[start:end].set(jnp.diag(coeff_reshaped))
+                    else:
+                        # General case - flatten and use first var.size elements
+                        coeff_flat = coeff.flatten()[:var.size]
+                        row = row.at[start:end].set(coeff_flat)
         constant = jnp.sum(expr.offset)
         
     elif hasattr(expr, 'left') and hasattr(expr, 'right') and type(expr).__name__ == 'MatMulExpression':
@@ -380,11 +817,14 @@ def _build_constraint_row(expr: Expression, var_indices: Dict[Variable, tuple[in
                     start, end = var_indices[var]
                     # Apply matrix multiplication: A @ coeff
                     result = A @ coeff
+                    if hasattr(result, "ndim") and result.ndim > 1:
+                        # Matrix result: flatten or sum to match shape
+                        result = result.flatten()
+                        if result.size != (end - start):
+                            result = result.sum(axis=0)
                     if result.ndim == 0:
-                        # Scalar result
                         row = row.at[start:end].set(result)
                     else:
-                        # Vector result
                         row = row.at[start:end].set(result)
             
             # Handle constant terms from both sides
@@ -406,13 +846,13 @@ def _build_constraint_row(expr: Expression, var_indices: Dict[Variable, tuple[in
             row = row.at[start:end].set(1.0)
             
     elif hasattr(expr, 'shape') and hasattr(expr, 'dtype'):
-        # JAX array constant
-        constant = float(jnp.sum(expr))
+        # JAX array constant (JIT-compatible)
+        constant = jnp.sum(expr)
         
     else:
-        # Try to extract as scalar constant
+        # Try to extract as scalar constant (JIT-compatible)
         try:
-            constant = float(expr)
+            constant = jnp.asarray(expr, dtype=jnp.float64)
         except:
             # Unknown expression type
             pass
@@ -521,7 +961,7 @@ def _extract_objective_terms(expr: Expression) -> tuple[Dict, Dict, float]:
     Returns:
         Tuple of (quad_terms, lin_terms, constant).
     """
-    from cvxjax.expressions import QuadraticExpression, AffineExpression, AddExpression, ScalarMultiplyExpression, MatMulExpression
+    from cvxjax.expressions import QuadraticExpression, AffineExpression, AddExpression, SubtractExpression, ScalarMultiplyExpression, MatMulExpression
     
     if isinstance(expr, QuadraticExpression):
         return expr.quad_coeffs, expr.lin_coeffs, expr.offset
@@ -551,6 +991,29 @@ def _extract_objective_terms(expr: Expression) -> tuple[Dict, Dict, float]:
                 lin_terms[var] = coeff
                 
         return quad_terms, lin_terms, left_const + right_const
+        
+    elif isinstance(expr, SubtractExpression):
+        # Handle subtraction: left - right
+        left_quad, left_lin, left_const = _extract_objective_terms(expr.left)
+        right_quad, right_lin, right_const = _extract_objective_terms(expr.right)
+        
+        # Merge quadratic terms (left - right)
+        quad_terms = dict(left_quad)
+        for key, coeff in right_quad.items():
+            if key in quad_terms:
+                quad_terms[key] = quad_terms[key] - coeff
+            else:
+                quad_terms[key] = -coeff
+        
+        # Merge linear terms (left - right)
+        lin_terms = dict(left_lin)
+        for var, coeff in right_lin.items():
+            if var in lin_terms:
+                lin_terms[var] = lin_terms[var] - coeff
+            else:
+                lin_terms[var] = -coeff
+                
+        return quad_terms, lin_terms, left_const - right_const
         
     elif isinstance(expr, ScalarMultiplyExpression):
         # Extract from the inner expression and scale
@@ -589,3 +1052,5 @@ def _extract_objective_terms(expr: Expression) -> tuple[Dict, Dict, float]:
     else:
         # Unknown expression type - return empty
         return {}, {}, 0.0
+
+

@@ -86,11 +86,11 @@ expr = A @ x  # Results in shape (3,)
 
 **Solution**:
 ```python
-# ❌ Wrong: duplicate names
+#  Wrong: duplicate names
 x1 = cx.Variable(shape=(3,), name="x")
 x2 = cx.Variable(shape=(5,), name="x")  # Same name!
 
-# ✅ Correct: unique names
+#  Correct: unique names
 x1 = cx.Variable(shape=(3,), name="weights")
 x2 = cx.Variable(shape=(5,), name="portfolio")
 ```
@@ -99,12 +99,12 @@ x2 = cx.Variable(shape=(5,), name="portfolio")
 
 **Solution**:
 ```python
-# ❌ Wrong: non-integer or non-tuple shapes
+#  Wrong: non-integer or non-tuple shapes
 x = cx.Variable(shape=5)          # Should be (5,)
 y = cx.Variable(shape=(3.0,))     # Should be (3,)
 z = cx.Variable(shape=[2, 3])     # Should be (2, 3)
 
-# ✅ Correct: tuple of integers
+#  Correct: tuple of integers
 x = cx.Variable(shape=(5,))
 y = cx.Variable(shape=(3,))
 z = cx.Variable(shape=(2, 3))
@@ -130,15 +130,15 @@ x / y          # Division by variable (non-convex)
 
 **Solutions**:
 ```python
-# ❌ Wrong: non-convex constraint
+#  Wrong: non-convex constraint
 x = cx.Variable(shape=(2,))
 constraint = x[0] * x[1] >= 1  # Non-convex
 
-# ✅ Correct: convex reformulation (if possible)
+#  Correct: convex reformulation (if possible)
 # Use sum_squares or quad_form for quadratic terms
 objective = cx.Minimize(cx.sum_squares(x))
 
-# ❌ Wrong: maximizing convex function
+#  Wrong: maximizing convex function
 objective = cx.Maximize(cx.sum_squares(x))  # Not convex!
 
 # ✅ Correct: minimize convex function
@@ -285,11 +285,11 @@ solution = problem.solve(tol=scaled_tol)
 
 1. **Avoid dynamic shapes**:
 ```python
-# ❌ Wrong: shape depends on runtime values
+# Wrong: shape depends on runtime values
 n = some_runtime_computation()
 x = cx.Variable(shape=(n,))
 
-# ✅ Correct: static shapes
+# Correct: static shapes
 N_MAX = 100  # Known at compile time
 x = cx.Variable(shape=(N_MAX,))
 ```
